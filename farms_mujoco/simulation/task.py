@@ -121,8 +121,8 @@ class ExperimentTask(Task):
 
         # Animat extensions
         animat_extensions: list[AnimatExtension] = [
-            import_item(extension.loader).from_options(
-                config=extension.config,
+            import_item(extension['loader']).from_options(
+                config=extension['config'],
                 experiment_options=experiment_options,
                 animat_i=animat_i,
                 animat_data=animat_data,

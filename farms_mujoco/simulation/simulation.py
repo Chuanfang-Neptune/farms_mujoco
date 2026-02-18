@@ -85,7 +85,7 @@ class Simulation:
         if 'MUJOCO_GL' not in os.environ:
             os.environ['MUJOCO_GL'] = (
                 'egl'
-                if self.options.runtime.headless
+                if self.options.runtime.headless and os.name != 'nt'
                 else 'glfw'  # 'osmesa'
             )
         pylog.debug(f'Using env variable : MUJOCO_GL={os.environ["MUJOCO_GL"]}')
