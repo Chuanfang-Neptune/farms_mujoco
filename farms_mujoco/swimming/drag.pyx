@@ -81,7 +81,9 @@ cdef void compute_force(
     """
     cdef unsigned int i
     for i in range(3):
-        force[i] = link_velocity[i]*link_velocity[i]
+        link_velocity_clamped = min(abs(link_velocity[i]), 4.0)
+        force[i] = link_velocity_clamped*link_velocity_clamped
+        # force[i] = link_velocity[i]*link_velocity[i]
         if link_velocity[i] < 0:
             force[i] *= -1
         force[i] *= viscosity*coefficients[i]
@@ -102,7 +104,9 @@ cdef void compute_torque(
     """
     cdef unsigned int i
     for i in range(3):
-        torque[i] = link_ang_velocity[i]*link_ang_velocity[i]
+        link_ang_velocity_clamped = min(abs(link_ang_velocity[i]), 6.28)
+        torque[i] = link_ang_velocity_clamped*link_ang_velocity_clamped
+        # torque[i] = link_ang_velocity[i]*link_ang_velocity[i]
         if link_ang_velocity[i] < 0:
             torque[i] *= -1
         torque[i] *= coefficients[i]
