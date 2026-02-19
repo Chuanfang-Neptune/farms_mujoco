@@ -3,10 +3,10 @@
 import numpy as np
 cimport numpy as np
 
-try:
-    from farms_muscle import rigid_tendon as rt
-except:
-    print("farms_muscle not installed")
+# try:
+#     from farms_muscle import rigid_tendon as rt
+# except:
+#     print("farms_muscle not installed")
 from mujoco import mj_contactForce
 
 from libc.math cimport abs, fmax, sqrt

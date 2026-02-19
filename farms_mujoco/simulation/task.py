@@ -24,7 +24,7 @@ try:
     from farms_muscle import rigid_tendon as rt_muscle
 except:
     rt_muscle = None
-    pylog.warning("farms_muscle not installed!")
+    # pylog.warning("farms_muscle not installed!")
 
 from .physics import (
     get_sensor_maps,
