@@ -5,5 +5,4 @@ scipy
 tqdm
 trimesh
 pywavefront
-dm_control
 imageio
