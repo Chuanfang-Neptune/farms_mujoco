@@ -80,7 +80,7 @@ setup(
         'scipy',
         'tqdm',
         'trimesh',
-        'dm_control',
+        # 'dm_control',
         'imageio',
         'pywavefront'
     ],
