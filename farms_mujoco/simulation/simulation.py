@@ -315,13 +315,19 @@ class Simulation:
             )
             try:
                 iseconds = 1/self.options.units.seconds
+                terminated = False
                 for iteration in _iterator:
                     self.update_step_options()
                     for _ in range(self.task.cb_sub_steps):
-                        self._env.step(action=None)
+                        timestep = self._env.step(action=None)
+                        # Stop when an extension ended the episode; the next
+                        # step would reset the environment
+                        if timestep is not None and timestep.last():
+                            terminated = True
+                            break
                     iteration += 1
                     physics_time = self.physics.time()*iseconds
-                    if physics_time > self.time_limit:
+                    if terminated or physics_time > self.time_limit:
                         break
                 self.end_extensions()
             except PhysicsError as err:

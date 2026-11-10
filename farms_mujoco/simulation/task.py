@@ -351,6 +351,13 @@ class ExperimentTask(Task):
         # Apply the accumulated external forces after all extensions.
         self.apply_xfrc(physics)
 
+        # Extensions may add engine-only loads after the central application,
+        # with after_apply_xfrc(task, physics); they are not in the logged xfrc
+        for extension in self.extensions:
+            hook = getattr(extension, 'after_apply_xfrc', None)
+            if hook is not None:
+                hook(task=self, physics=physics)
+
     def initialize_maps(self, physics: Physics):
         """Initialise data"""
         physics_named = physics.named.data

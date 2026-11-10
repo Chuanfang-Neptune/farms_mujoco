@@ -19,6 +19,20 @@ from .task import ExperimentTask
 from .mjcf import mjcf2str
 
 
+def free_joint_body(model, prefix: str):
+    """Id of the body carrying the first free joint named ``prefix*``.
+
+    None when the animat has no free joint (e.g. a fixed base).
+    """
+    for joint_i in range(model.njnt):
+        if (
+                model.jnt_type[joint_i] == mujoco.mjtJoint.mjJNT_FREE
+                and model.joint(joint_i).name.startswith(prefix)
+        ):
+            return int(model.jnt_bodyid[joint_i])
+    return None
+
+
 def create_primitive(scn, primitive, **kwargs):
     """Create primitive geom on a MuJoCo scene.
 
@@ -308,9 +322,13 @@ class CameraFollower(AnimatViewerExtension):
             body_name = f'{prefix}base_link'
             try:
                 body_id = physics.model.body(body_name).id
+            except (KeyError, AttributeError):
+                # No base_link: track the body with the animat's free joint
+                body_id = free_joint_body(physics.model, prefix)
+            if body_id is not None:
                 cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
                 cam.trackbodyid = body_id
-            except (KeyError, AttributeError):
+            else:
                 # Fallback: manual lookat if body not found
                 cam.type = mujoco.mjtCamera.mjCAMERA_FREE
                 cam.lookat = self.com_position(iteration=0) * self.units.meters

@@ -2,7 +2,9 @@
 
 include 'types.pxd'
 
-from libc.math cimport isfinite, sqrt
+from libc.math cimport fabs, isfinite, sqrt
+
+import os
 
 import numpy as np
 cimport numpy as np
@@ -110,9 +112,9 @@ cdef inline double implicit_drag_velocity(
 
     """
     cdef double b = a * velocity + f_other
-    if b >= 0:
-        return (-a + sqrt(a * a + 4.0 * c * b)) / (2.0 * c)
-    return -((-a + sqrt(a * a - 4.0 * c * b)) / (2.0 * c))
+    # Rationalised root: equal to (-a + sqrt(a^2 + 4cb))/(2c) for b >= 0
+    # and to its mirror for b < 0, without the cancellation at 4c|b| << a^2
+    return 2.0 * b / (a + sqrt(a * a + 4.0 * c * fabs(b)))
 
 
 cdef void compute_force(
@@ -156,7 +158,9 @@ cdef void compute_force(
         if mass > 0 and dt > 0 and c_drag > 0 and isfinite(c_drag):
             a = mass / dt
             v_new = implicit_drag_velocity(v, a, c_drag, f_other)
-            force[i] = mass * (v_new - v) / dt
+            # Equal to mass*(v_new - v)/dt, without subtracting near-equal
+            # velocities
+            force[i] = f_other - c_drag * v_new * fabs(v_new)
         else:
             # Explicit fallback, identical to the legacy form for
             # negative coefficients.
@@ -206,7 +210,8 @@ cdef void compute_torque(
         ):
             a = inertia[i] / dt
             w_new = implicit_drag_velocity(w, a, c_drag, torque_other[i])
-            torque[i] = inertia[i] * (w_new - w) / dt
+            # Equal to inertia*(w_new - w)/dt, as in compute_force
+            torque[i] = torque_other[i] - c_drag * w_new * fabs(w_new)
         else:
             # Explicit fallback, identical to the legacy form for
             # negative coefficients.
@@ -250,6 +255,52 @@ cdef void compute_buoyancy(
             buoyancy[i] = 0.0
 
 
+cdef void compute_reactive(
+    DTYPEv1 force,
+    DTYPEv1 vel_now,
+    DTYPEv1 vel_prev,
+    bint have_prev,
+    DTYPEv1 global2urdf,
+    double dt,
+    DTYPEv1 added_mass_residual,
+    double submerged,
+    DTYPEv1 accel,
+    DTYPEv1 tmp,
+    DTYPEv1 quat_c,
+    DTYPEv1 tmp4,
+):
+    """Add the anisotropic added-mass load, URDF frame
+
+    With added mass M per URDF axis and m_iso = max(M), the engine
+    carries s*m_iso in the body mass (SwimmingHandler.step), with s the
+    submerged fraction. This adds the residual s*(m_iso - M)*a, with a
+    the CoM acceleration from the velocity change since the previous
+    call. Gravity on the added mass is cancelled outside this wrench, by
+    SwimmingExtension.after_apply_xfrc.
+
+    :param force: Force to add to, URDF frame
+    :param vel_now: CoM velocity now, global frame
+    :param vel_prev: CoM velocity at the previous call, global frame
+    :param have_prev: vel_prev is valid (False on the first call)
+    :param global2urdf: Global to URDF frame transform
+    :param dt: Timestep (0: no residual)
+    :param added_mass_residual: m_iso - M per URDF axis
+    :param submerged: Submerged fraction of the link, 0..1
+    :param accel: Temporary vector
+    :param tmp: Temporary vector
+    :param quat_c: Temporary conjugate quaternion
+    :param tmp4: Temporary quaternion
+
+    """
+    cdef unsigned int i
+    if dt > 0 and have_prev:
+        for i in range(3):
+            tmp[i] = (vel_now[i] - vel_prev[i])/dt
+        quat_rot(tmp, global2urdf, quat_c, tmp4, accel)
+        for i in range(3):
+            force[i] += submerged*added_mass_residual[i]*accel[i]
+
+
 cpdef bint drag_forces(
         double time,
         unsigned int iteration,
@@ -269,6 +320,12 @@ cpdef bint drag_forces(
         double dt=0.0,
         DTYPEv1 buoyancy_center=None,
         DTYPEv1 inertia=None,
+        bint reactive=0,
+        double added_mass_iso=0.0,
+        DTYPEv1 added_mass_residual=None,
+        bint implicit=1,
+        DTYPEv1 vel_prev=None,
+        bint have_prev=0,
 ):
     """Drag swimming
 
@@ -297,6 +354,14 @@ cpdef bint drag_forces(
     :param buoyancy_center: Offset of CoB from link origin in URDF frame
     :param inertia: Diagonal inertia in URDF frame (real units). If
         None, angular drag falls back to the explicit form.
+    :param reactive: Add the added-mass residual (compute_reactive) and
+        use mass + submerged*added_mass_iso in the implicit drag solve
+    :param added_mass_iso: Isotropic added mass m_iso
+    :param added_mass_residual: m_iso - M per URDF axis
+    :param implicit: Implicit drag force and torque (0: explicit; the
+        added-mass residual still uses dt)
+    :param vel_prev: CoM velocity (global) at the handler's previous call
+    :param have_prev: vel_prev is valid
     """
     cdef unsigned int i
     cdef double pos_x = data_links.array[iteration, links_index, 0]
@@ -306,7 +371,10 @@ cpdef bint drag_forces(
     cdef double submerged = submersion_fraction(pos_z, height, surface)
     cdef DTYPEv1 force=z3[0], torque=z3[1], buoyancy=z3[2], tmp=z3[3]
     cdef DTYPEv1 link_lin_velocity=z3[4], link_ang_velocity=z3[5]
-    cdef DTYPEv1 fluid_velocity_urdf=z3[6]
+    cdef DTYPEv1 fluid_velocity_urdf=z3[6], accel=z3[7]
+    # Mass of the implicit drag solve: the engine mass, m + s*m_iso with
+    # added mass; buoyancy uses the link mass
+    cdef double mass_engine = mass
     cdef DTYPEv1 urdf2global=z4[0], com2global=z4[1]
     cdef DTYPEv1 global2urdf=z4[2], urdf2com=z4[3], com2urdf=z4[4]
     cdef DTYPEv1 quat_c=z4[5], tmp4=z4[6]
@@ -393,6 +461,8 @@ cpdef bint drag_forces(
     link_lin_velocity[1] -= fluid_velocity_urdf[1]
     link_lin_velocity[2] -= fluid_velocity_urdf[2]
 
+    if reactive:
+        mass_engine = mass + submerged*added_mass_iso
     # Drag forces in URDF frame
     compute_force(
         force=force,
@@ -400,8 +470,8 @@ cpdef bint drag_forces(
         coefficients=coefficients[0],
         buoyancy=buoyancy,
         viscosity=water.viscosity(time, pos_x, pos_y, cob_z),
-        mass=mass,
-        dt=dt,
+        mass=mass_engine,
+        dt=dt if implicit else 0.0,
         submerged=submerged,
     )
 
@@ -431,10 +501,26 @@ cpdef bint drag_forces(
         link_ang_velocity=link_ang_velocity,
         coefficients=coefficients[1],
         inertia=inertia_vec,
-        dt=dt,
+        dt=dt if implicit else 0.0,
         submerged=submerged,
         torque_other=tmp,
     )
+    # Added-mass residual in URDF frame, at the CoM (no CoB moment arm)
+    if reactive:
+        compute_reactive(
+            force=force,
+            vel_now=data_links.com_lin_velocity_cy(iteration, links_index),
+            vel_prev=vel_prev,
+            have_prev=have_prev,
+            global2urdf=global2urdf,
+            dt=dt,
+            added_mass_residual=added_mass_residual,
+            submerged=submerged,
+            accel=accel,
+            tmp=tmp,
+            quat_c=quat_c,
+            tmp4=tmp4,
+        )
 
     # Drag forces in inertial frame
     quat_rot(force, urdf2com, quat_c, tmp4, force)
@@ -600,6 +686,16 @@ cdef class SwimmingHandler:
     cdef DTYPEv2 z3
     cdef DTYPEv2 z4
     cdef DTYPEv3 links_coefficients
+    # Added mass (extras.reactive) and drag mode
+    cdef unsigned char[:] reactive
+    cdef bint any_reactive
+    cdef bint implicit
+    cdef DTYPEv2 vel_prev
+    cdef bint have_prev
+    cdef DTYPEv1 added_mass_iso
+    cdef DTYPEv2 added_mass_residual
+    cdef object engine_mass
+    cdef object body_ids
 
     def __init__(self, data, animat_options, arena_options, units, physics, water=None, prefix=''):
         super(SwimmingHandler, self).__init__()
@@ -620,7 +716,9 @@ cdef class SwimmingHandler:
             velocity=np.array(water_options.velocity, dtype=float),
             viscosity=float(water_options.viscosity),
         ) if water is None else water
-        self.z3 = np.zeros([7, 3])
+        self.z3 = np.zeros([8, 3])  # [7]: compute_reactive's acceleration
+        # FARMS_DRAG_IMPLICIT=0: explicit drag force and torque
+        self.implicit = os.environ.get('FARMS_DRAG_IMPLICIT', '1') != '0'
         self.z4 = np.zeros([7, 4])
         links = [
             link
@@ -641,10 +739,14 @@ cdef class SwimmingHandler:
             body_inertia_urdf(physics.model, body_id)
             for body_id in body_ids
         ], dtype=float)/(self.kilograms*self.meters**2)
+        self._setup_reactive(links, body_ids, physics)
+        # Swim height: FARMS_SWIM_HEIGHT_FACTOR (default 0.5) times the
+        # bounding radius of the link's first geom
+        height_factor = float(os.environ.get('FARMS_SWIM_HEIGHT_FACTOR', '0.5'))
         link_heights = []
         for link in links:
             matching_heights = [
-                0.75*physics.model.geom_rbound[geom_i]
+                height_factor*physics.model.geom_rbound[geom_i]
                 for geom_i in range(len(physics.model.geom_bodyid))
                 if links_row.names[physics.named.model.geom_bodyid[geom_i]]
                 == prefix+link.name
@@ -687,10 +789,66 @@ cdef class SwimmingHandler:
         if self.sph:
             self.water._surface = 1e8
 
+    def _setup_reactive(self, links, body_ids, physics):
+        """Added mass from link.extras['reactive']
+
+        {'added_mass_ratio': [x, y, z]}: added mass along the URDF axes in
+        multiples of the link mass (see compute_reactive); other keys
+        raise. The engine mass is set by step(), not here, and
+        mj_setConst is not run: body_invweight0 and dof_invweight0 keep
+        their dry-mass values.
+        """
+        sizes = {'added_mass_ratio': 3}
+        terms = [link.extras.get('reactive') if link.extras else None for link in links]
+        for link, term in zip(links, terms):
+            if term is not None and set(term) - set(sizes):
+                raise ValueError(
+                    f'{link.name}: unknown reactive terms '
+                    f'{sorted(set(term) - set(sizes))}, expected {sorted(sizes)}'
+                )
+        self.reactive = np.array([term is not None for term in terms], dtype=np.uint8)
+        self.any_reactive = bool(np.any(self.reactive))
+        get = lambda key: np.array([
+            term.get(key, [0.0]*sizes[key]) if term is not None else [0.0]*sizes[key]
+            for term in terms
+        ], dtype=float).reshape(-1, sizes[key])
+        added_mass = get('added_mass_ratio')*np.asarray(self.masses)[:, None]
+        if np.any(added_mass < 0):
+            raise ValueError('Added mass must be non-negative')
+        self.added_mass_iso = added_mass.max(axis=1)
+        self.added_mass_residual = np.asarray(self.added_mass_iso)[:, None] - added_mass
+        self.engine_mass = physics.model.body_mass
+        self.body_ids = list(body_ids)
+        # CoM velocity (global) at the previous call, for the residual
+        self.vel_prev = np.zeros([len(links), 3])
+        self.have_prev = 0
+
     cpdef step(self, double time, unsigned int iteration, double dt=0.0):
-        """Swimming step"""
-        cdef unsigned int i
+        """Swimming step
+
+        With reactive links, first sets each one's engine mass to
+        m + s*m_iso (s: submerged fraction).
+        """
+        cdef unsigned int i, j
         cdef bint apply_force = 1
+        cdef double s
+        cdef DTYPEv1 vel_now
+        if self.drag and self.any_reactive:
+            for i in range(self.n_links):
+                if not self.reactive[i]:
+                    continue
+                s = submersion_fraction(
+                    self.links.array[iteration, self.links_indices[i], 2],
+                    self.heights[i],
+                    self.water.surface(
+                        time,
+                        self.links.array[iteration, self.links_indices[i], 0],
+                        self.links.array[iteration, self.links_indices[i], 1],
+                    ),
+                )
+                self.engine_mass[self.body_ids[i]] = (
+                    self.masses[i] + s*self.added_mass_iso[i]
+                )*self.kilograms
         if self.drag or self.sph:
             for i in range(self.n_links):
                 if self.drag:
@@ -713,7 +871,23 @@ cdef class SwimmingHandler:
                         dt=dt,
                         buoyancy_center=self.buoyancy_centers[i],
                         inertia=self.inertias[i],
+                        reactive=self.reactive[i],
+                        added_mass_iso=self.added_mass_iso[i],
+                        added_mass_residual=self.added_mass_residual[i],
+                        implicit=self.implicit,
+                        vel_prev=self.vel_prev[i],
+                        have_prev=self.have_prev,
                     )
+        if self.drag and self.any_reactive:
+            # Velocity of every reactive link, in or out of the water, for
+            # the next residual
+            for i in range(self.n_links):
+                if self.reactive[i]:
+                    vel_now = (<LinkSensorArrayCy> self.links).com_lin_velocity_cy(
+                        iteration, self.links_indices[i])
+                    for j in range(3):
+                        self.vel_prev[i, j] = vel_now[j]
+            self.have_prev = 1
 
     cpdef set_frame(self, int frame):
         """Set frame"""

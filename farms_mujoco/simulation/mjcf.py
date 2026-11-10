@@ -46,6 +46,15 @@ _TRIMESH_CACHE: dict[str, tri.Trimesh] = {}
 _WAVEFRONT_CACHE: dict[str, pwf.Wavefront] = {}
 
 
+def textures_enabled(headless: bool) -> bool:
+    """Whether mesh textures are loaded: True unless FARMS_TEXTURES=0
+
+    `headless` is ignored, so offscreen (headless) video renders are
+    textured.
+    """
+    return os.environ.get('FARMS_TEXTURES', '') != '0'
+
+
 def load_trimesh(mesh_path: str, headless: bool = False) -> tri.Trimesh:
     """Load a trimesh with caching
 
@@ -53,7 +62,7 @@ def load_trimesh(mesh_path: str, headless: bool = False) -> tri.Trimesh:
 
     """
     if mesh_path not in _TRIMESH_CACHE:
-        if headless:
+        if not textures_enabled(headless):
             _, ext = os.path.splitext(mesh_path)
             if ext.lower() == '.obj':
                 from trimesh.exchange.obj import load_obj
@@ -225,12 +234,13 @@ def grid_material(mjcf_model: mjcf.Element, n_repeat = 1) -> (mjcf.Element, mjcf
             name='texture_grid',
             type='2d',
             builtin='checker',
-            rgb1=[0.1, 0.2, 0.3],
-            rgb2=[0.2, 0.3, 0.4],
+            # FARMS_DAYLIGHT=1: low-contrast earth-tone checker
+            rgb1=[0.55, 0.51, 0.43] if daylight_enabled() else [0.1, 0.2, 0.3],
+            rgb2=[0.60, 0.56, 0.48] if daylight_enabled() else [0.2, 0.3, 0.4],
             width=300,
             height=300,
             mark='edge',
-            markrgb=[0.2, 0.3, 0.4],
+            markrgb=[0.63, 0.59, 0.51] if daylight_enabled() else [0.2, 0.3, 0.4],
         )
     material = mjcf_model.asset.find(
         namespace='material',
@@ -484,7 +494,7 @@ def mjc_add_link(
                             f"{mat_path} exists, either overwrite or change name"
                         )
                     mesh_kwargs = {}
-                    if extension == '.obj' and not headless:
+                    if extension == '.obj' and textures_enabled(headless):
                         mesh_kwargs['header'] = "FARMS composite mesh"
                         mesh_kwargs['mtl_name'] = f"{mesh_name}_composite.mtl"
                         mesh_kwargs['include_normals'] = True
@@ -500,7 +510,7 @@ def mjc_add_link(
                 mesh_path = new_path
 
             # Wavefront textures
-            if extension == '.obj' and not headless:
+            if extension == '.obj' and textures_enabled(headless):
                 try:
                     wavefront = load_wavefront(mesh_path)
                 except pwf.exceptions.PywavefrontException as err:
@@ -1401,8 +1411,26 @@ def mjcf2str(
     return dom.toprettyxml(indent=2*' ')
 
 
+def daylight_enabled() -> bool:
+    """True if FARMS_DAYLIGHT=1: daylight sky, lights, ground and shadows"""
+    return os.environ.get('FARMS_DAYLIGHT', '') == '1'
+
+
 def night_sky(mjcf_model: mjcf.RootElement):
-    """Night sky"""
+    """Night sky, or a daylight gradient with FARMS_DAYLIGHT=1"""
+    if daylight_enabled():
+        # Blue zenith (rgb1) to a pale horizon (rgb2)
+        mjcf_model.asset.add(
+            'texture',
+            name='skybox',
+            type='skybox',
+            builtin='gradient',
+            rgb1=[0.32, 0.53, 0.82],
+            rgb2=[0.84, 0.90, 0.96],
+            width=800,
+            height=800,
+        )
+        return
     mjcf_model.asset.add(  # Add night sky texture to assets
         'texture',
         name='skybox',
@@ -1458,6 +1486,31 @@ def add_lights(
         rot = np.zeros(3)
     rot_inv = Rotation.from_euler(angles=rot, seq='xyz').inv()
     mtr = units.meters
+    if daylight_enabled():
+        # Directional sun casting the shadow, and a fill light; both follow
+        # the animat (trackcom)
+        link.add(
+            'light', name='light_animat', mode='trackcom', active='true',
+            pos=rot_inv.as_matrix() @ [-0.20, 0.20, 0.55],
+            dir=rot_inv.as_matrix() @ [0.62, -0.72, -0.86],
+            castshadow=('false' if os.environ.get('FARMS_CASTSHADOW', '1') == '0'
+                        else 'true'),
+            directional='true',
+            ambient=[0.22, 0.24, 0.28],
+            diffuse=[0.85, 0.82, 0.75],      # slightly warm sun
+            specular=[0.20, 0.20, 0.20],
+        )
+        # Fill light from the opposite side, without shadow
+        link.add(
+            'light', name='light_fill', mode='trackcom', active='true',
+            pos=rot_inv.as_matrix() @ [0.30, -0.15, 0.40],
+            dir=rot_inv.as_matrix() @ [-0.6, 0.35, -1.0],
+            castshadow='false', directional='true',
+            ambient=[0.0, 0.0, 0.0],
+            diffuse=[0.22, 0.25, 0.30],      # cool sky bounce
+            specular=[0.0, 0.0, 0.0],
+        )
+        return
     link.add(
         'light',
         name='light_animat',
@@ -1465,7 +1518,9 @@ def add_lights(
         active=str(True).lower(),
         pos=rot_inv.as_matrix() @ [-10, 10, 30],  # *mtr
         dir=rot_inv.as_matrix() @ [1.0, -1.0, -3.0],
-        castshadow=str(True).lower(),
+        # FARMS_CASTSHADOW=0 disables shadow casting
+        castshadow=('false' if os.environ.get('FARMS_CASTSHADOW', '1') == '0'
+                    else str(True).lower()),
         directional=str(False).lower(),
         attenuation=[1.0, 0.0, 0.0],
         cutoff=100,  # *mtr
@@ -1661,9 +1716,15 @@ def setup_mjcf_xml(
     mjcf_model.visual.map.alpha = 0.3
     mjcf_model.visual.map.fogstart = 3
     mjcf_model.visual.map.fogend = 10
-    mjcf_model.visual.map.haze = 0.3
-    mjcf_model.visual.map.shadowclip = 1
-    mjcf_model.visual.map.shadowscale = 3e-1
+    mjcf_model.visual.map.haze = 0.15 if daylight_enabled() else 0.3
+    # FARMS_DAYLIGHT=1: lighter haze and shadow-map settings for the
+    # directional sun (FARMS_SHADOWCLIP / FARMS_SHADOWSCALE /
+    # FARMS_SHADOWSIZE override them)
+    mjcf_model.visual.map.shadowclip = (
+        float(os.environ.get('FARMS_SHADOWCLIP', '0.20')) if daylight_enabled() else 1)
+    mjcf_model.visual.map.shadowscale = (
+        float(os.environ.get('FARMS_SHADOWSCALE', '1.5')) if daylight_enabled()
+        else 3e-1)
     mjcf_model.visual.map.actuatortendon = 2*scale
     mjcf_model.visual.scale.forcewidth = 0.01*scale
     mjcf_model.visual.scale.contactwidth = 0.03*scale
@@ -1681,7 +1742,9 @@ def setup_mjcf_xml(
     mjcf_model.visual.scale.framewidth = 0.01*scale
     mjcf_model.visual.scale.constraint = 0.01*scale
     mjcf_model.visual.scale.slidercrank = 0.01*scale
-    mjcf_model.visual.quality.shadowsize = simulation_options.mujoco.shadow_size
+    mjcf_model.visual.quality.shadowsize = (
+        int(os.environ.get('FARMS_SHADOWSIZE', '16384')) if daylight_enabled()
+        else simulation_options.mujoco.shadow_size)
     mjcf_model.visual.quality.offsamples = 4
     mjcf_model.visual.quality.numslices = 28
     mjcf_model.visual.quality.numstacks = 16
@@ -1772,6 +1835,13 @@ def setup_mjcf_xml(
         if simulation_options is not None
         else 1e-6,
     )
+    # Constraint solver tolerance (MuJoCo's default 1e-8 if not set)
+    mjcf_model.option.tolerance = kwargs.pop(
+        'tolerance',
+        getattr(simulation_options.mujoco, 'tolerance', 1e-8)
+        if simulation_options is not None
+        else 1e-8,
+    )
     mjcf_model.option.flag.energy = "enable"
 
     # Animat options
@@ -1810,6 +1880,11 @@ def setup_mjcf_xml(
                     assert len(link.friction) == 3, len(geom.friction)
                     assert len(geom.friction) == 3, len(geom.friction)
                     geom.friction = link.friction
+                    # Link contact parameters override the animat-wide ones
+                    if getattr(link, 'solref', None) is not None:
+                        geom.solref = scale_solref(list(link.solref), units)
+                    if getattr(link, 'solimp', None) is not None:
+                        geom.solimp = scale_solimp(list(link.solimp), units)
                     geom.fluidshape = None
                     geom.fluidcoef = [0, 0, 0, 0, 0]
 
@@ -1893,7 +1968,8 @@ def setup_mjcf_xml(
     mjcf_xml_str = mjcf2str(mjcf_model=mjcf_model)
     if kwargs.pop('show_mjcf', False):
         pylog.info(mjcf_xml_str)
-    save_mjcf = kwargs.pop('save_mjcf', False)
+    # FARMS_SAVE_MJCF=<path>: save the built model to <path>
+    save_mjcf = kwargs.pop('save_mjcf', False) or os.environ.get('FARMS_SAVE_MJCF', '')
     if save_mjcf:
         path = save_mjcf if isinstance(save_mjcf, str) else 'simulation_mjcf.xml'
         os.makedirs(os.path.dirname(path), exist_ok=True)

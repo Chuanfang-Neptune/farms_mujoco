@@ -184,6 +184,23 @@ class SwimmingExtension(AnimatExtension):
             water=self._water_properties,
             prefix=get_prefix(self.animat_i),
         )
+        # Body masses before SwimmingHandler.step adds the added mass
+        indices = task.maps[self.animat_i]['sensors']['data2xfrc']
+        self._dry_mass = np.array(physics.model.body_mass[indices], dtype=float)
+
+    def after_apply_xfrc(self, task, physics):
+        """Cancel gravity on the added mass
+
+        SwimmingHandler.step sets the engine mass of reactive links to
+        m + s*m_iso; an upward force at the CoM cancels gravity on the
+        mass above the dry mass.
+        """
+        indices = task.maps[self.animat_i]['sensors']['data2xfrc']
+        excess = physics.model.body_mass[indices] - self._dry_mass
+        if np.any(excess > 0.0):
+            physics.data.xfrc_applied[indices, 2] -= (
+                excess*physics.model.opt.gravity[2]
+            )
 
     def before_step(self, task, action, physics):
         """Step hydrodynamics"""

@@ -167,6 +167,8 @@ class CameraRecording(TaskExtension):
             dtype=np.uint8
         )
         self.out = None
+        # True when frames go to an open cv2 writer as they are rendered
+        self.streaming = False
         video_path, video_extension = os.path.splitext(kwargs.pop('path'))
         match video_extension:
             case '.mp4':
@@ -203,7 +205,9 @@ class CameraRecording(TaskExtension):
     @staticmethod
     def _build_video_writer(output_path, fps, frame_size):
         """Return a VideoWriter preferring H.264 for broad compatibility."""
-        preferred_codecs = ['avc1', 'H264', 'X264', 'mp4v']
+        # mp4v first: a failed H.264 attempt (libopenh264 not loadable) can
+        # make later writers in the same process fail to open
+        preferred_codecs = ['mp4v', 'avc1', 'H264', 'X264']
         for codec in preferred_codecs:
             fourcc = cv2.VideoWriter_fourcc(*codec)
             writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
@@ -211,23 +215,13 @@ class CameraRecording(TaskExtension):
                 pylog.info('Using %s codec for video export', codec)
                 return writer
             writer.release()
-        pylog.warning(
-            'No compatible H.264 codec found, falling back to mp4v',
-        )
-        return cv2.VideoWriter(
-            output_path,
-            cv2.VideoWriter_fourcc(*'mp4v'),
-            fps,
-            frame_size,
-        )
+        # None: save() uses the matplotlib writer on the buffered frames
+        pylog.warning('No usable video codec found; falling back to the buffered writer')
+        return None
 
     def initialize_episode(self, task, physics):
         """Initialize episode"""
         self.sample = 0
-        self.data = np.zeros(
-            [self.n_iterations//(self.skips+1)+1, self.height, self.width, 3],
-            dtype=np.uint8,
-        )
         if USE_CV2:
             video_path = f'{self.video.path}{self.video.file_extension}'
             dirname = os.path.dirname(video_path)
@@ -238,6 +232,16 @@ class CameraRecording(TaskExtension):
                 self.fps,
                 (self.width, self.height),
             )
+        # Frame buffer: one frame when streaming to cv2, else the whole
+        # recording for the matplotlib writer
+        self.streaming = bool(
+            USE_CV2 and self.out is not None and self.out.isOpened()
+        )
+        frames = 1 if self.streaming else self.n_iterations//(self.skips+1)+1
+        self.data = np.zeros(
+            [frames, self.height, self.width, 3],
+            dtype=np.uint8,
+        )
         if self.viewer != 'dm_control':
             if self.animat_id is not None:
                 self.links = task.data.animats[self.animat_id].sensors.links
@@ -247,12 +251,13 @@ class CameraRecording(TaskExtension):
             if self.camera is None:
                 self.camera = mujoco.MjvCamera()
                 self.camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-                self.camera.lookat[:] = np.array(self.offset)
+                # distance and offset are in metres
+                self.camera.lookat[:] = np.array(self.offset)*task.units.meters
                 if self.links is not None:
                     self.camera.lookat[:] += np.array(
                         self.links.global_com_position(iteration=0),
                     )*task.units.meters
-                self.camera.distance = self.distance
+                self.camera.distance = self.distance*task.units.meters
                 self.camera.azimuth = self.azimuth
                 self.camera.elevation = self.elevation
                 self.renderer = mujoco.Renderer(
@@ -265,8 +270,9 @@ class CameraRecording(TaskExtension):
         """Before step"""
         del action
         if not task.iteration % (self.skips+1):
+            slot = 0 if self.streaming else self.sample
             if self.viewer == 'dm_control':
-                self.data[self.sample, :, :, :] = physics.render(
+                self.data[slot, :, :, :] = physics.render(
                     width=self.width,
                     height=self.height,
                     camera_id=self.camera,
@@ -276,14 +282,14 @@ class CameraRecording(TaskExtension):
                 timediff = now - self.last_capture
                 self.last_capture = now
                 self.camera.azimuth += self.angular_velocity*timediff
-                self.camera.lookat[:] = np.array(self.offset)
+                self.camera.lookat[:] = np.array(self.offset)*task.units.meters
                 if self.links is not None:
                     self.camera.lookat[:] += np.array(
                         self.links.global_com_position(
                             iteration=task.iteration-1,
                         ),
                     )*task.units.meters
-                self.camera.distance  = self.distance
+                self.camera.distance  = self.distance*task.units.meters
                 self.camera.elevation = self.elevation
                 if self.renderer is not None:
                     self.renderer.update_scene(
@@ -298,9 +304,17 @@ class CameraRecording(TaskExtension):
                         render_scene = getattr(extension, 'render_scene', None)
                         if render_scene is not None:
                             render_scene(self.renderer.scene)
-                    self.renderer.render(out=self.data[self.sample, :, :, :])
+                    self.renderer.render(out=self.data[slot, :, :, :])
+            # Extensions may draw into the rendered RGB frame with
+            # render_overlay(frame, task)
+            for extension in task.extensions:
+                if not getattr(extension, 'show_on_camera', True):
+                    continue
+                render_overlay = getattr(extension, 'render_overlay', None)
+                if render_overlay is not None:
+                    render_overlay(self.data[slot, :, :, :], task)
             if self.out is not None:
-                self.out.write(self.data[self.sample, :, :, :][:, :, [2, 1, 0]])
+                self.out.write(self.data[slot, :, :, :][:, :, [2, 1, 0]])
             self.sample += 1
 
     def end_episode(self, task, physics):
@@ -331,14 +345,14 @@ class CameraRecording(TaskExtension):
             if iteration is not None
             else self.sample
         )
-        if USE_CV2:
+        # With cv2 but no open writer, the matplotlib writer gets an RGBA copy
+        data = self.data
+        if USE_CV2 and self.out is None:
             data = np.zeros(
                 [sample+1, self.height, self.width, 4],
                 dtype=np.uint8
             )
             data[:, :, :, :3] = self.data[:sample+1]
-        else:
-            data = self.data
         pylog.debug(
             'Recording video to %s with %s (fps=%s, speed=%s, skips=%s, frame=%s/%s)',
             filename,
